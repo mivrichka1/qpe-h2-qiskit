@@ -1,0 +1,174 @@
+"""Quantum Phase Estimation for a small H2 Hamiltonian.
+
+The project demonstrates the main numerical steps behind QPE:
+1. define a small Hamiltonian;
+2. diagonalize it exactly for reference;
+3. transform the Hamiltonian into a unitary operator;
+4. build and simulate a QPE circuit;
+5. reconstruct an energy estimate from the measured phase.
+
+The implementation is intentionally compact and suitable for an educational portfolio.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from qiskit import QuantumCircuit, transpile
+from qiskit.circuit.library import QFT, UnitaryGate
+from qiskit_aer import AerSimulator
+from scipy.linalg import expm
+
+
+def pauli_matrices() -> dict[str, np.ndarray]:
+    """Return basic 2x2 Pauli matrices and identity."""
+    return {
+        "I": np.array([[1, 0], [0, 1]], dtype=complex),
+        "X": np.array([[0, 1], [1, 0]], dtype=complex),
+        "Y": np.array([[0, -1j], [1j, 0]], dtype=complex),
+        "Z": np.array([[1, 0], [0, -1]], dtype=complex),
+    }
+
+
+def kron2(left: str, right: str) -> np.ndarray:
+    """Kronecker product of two one-qubit Pauli operators."""
+    p = pauli_matrices()
+    return np.kron(p[left], p[right])
+
+
+def build_h2_hamiltonian() -> np.ndarray:
+    """Build a common reduced 2-qubit H2 Hamiltonian.
+
+    The coefficients are a compact educational example often used to show
+    small-molecule Hamiltonian simulation.
+    """
+    return (
+        -1.052373245772859 * kron2("I", "I")
+        + 0.39793742484318045 * kron2("I", "Z")
+        - 0.39793742484318045 * kron2("Z", "I")
+        - 0.01128010425623538 * kron2("Z", "Z")
+        + 0.18093119978423156 * kron2("X", "X")
+    )
+
+
+def exact_ground_state(hamiltonian: np.ndarray) -> tuple[float, np.ndarray]:
+    """Return the smallest eigenvalue and its eigenvector."""
+    eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian)
+    index = int(np.argmin(eigenvalues))
+    return float(eigenvalues[index].real), eigenvectors[:, index]
+
+
+def prepare_state(circuit: QuantumCircuit, state: np.ndarray, qubits: list[int]) -> None:
+    """Initialize the system register in a selected eigenstate."""
+    normalized = state / np.linalg.norm(state)
+    circuit.initialize(normalized, qubits)
+
+
+def build_qpe_circuit(
+    unitary: np.ndarray,
+    eigenstate: np.ndarray,
+    n_counting_qubits: int,
+) -> QuantumCircuit:
+    """Build the Quantum Phase Estimation circuit."""
+    n_system_qubits = 2
+    total_qubits = n_counting_qubits + n_system_qubits
+
+    counting = list(range(n_counting_qubits))
+    system = list(range(n_counting_qubits, total_qubits))
+
+    circuit = QuantumCircuit(total_qubits, n_counting_qubits)
+
+    prepare_state(circuit, eigenstate, system)
+
+    for qubit in counting:
+        circuit.h(qubit)
+
+    base_gate = UnitaryGate(unitary, label="U")
+
+    for idx, qubit in enumerate(counting):
+        power = 2 ** idx
+        controlled_gate = base_gate.power(power).control()
+        circuit.append(controlled_gate, [qubit, *system])
+
+    inverse_qft = QFT(num_qubits=n_counting_qubits, inverse=True, do_swaps=True).to_gate()
+    circuit.append(inverse_qft, counting)
+
+    circuit.measure(counting, range(n_counting_qubits))
+    return circuit
+
+
+def run_qpe(
+    hamiltonian: np.ndarray,
+    eigenstate: np.ndarray,
+    n_counting_qubits: int = 5,
+    shots: int = 4096,
+) -> tuple[dict[str, int], float, float, float]:
+    """Run QPE and return counts, estimated phase and energy estimate."""
+    eigenvalues = np.linalg.eigvalsh(hamiltonian)
+    min_energy = float(np.min(eigenvalues).real)
+    max_energy = float(np.max(eigenvalues).real)
+
+    shift = -min_energy
+    scale = max_energy - min_energy + 1.0
+
+    shifted_scaled_hamiltonian = (hamiltonian + shift * np.eye(hamiltonian.shape[0])) / scale
+    unitary = expm(2j * np.pi * shifted_scaled_hamiltonian)
+
+    circuit = build_qpe_circuit(unitary, eigenstate, n_counting_qubits)
+
+    simulator = AerSimulator()
+    compiled = transpile(circuit, simulator)
+    result = simulator.run(compiled, shots=shots).result()
+    counts = result.get_counts()
+
+    best_bitstring = max(counts, key=counts.get)
+    estimated_phase = int(best_bitstring, 2) / (2 ** n_counting_qubits)
+
+    estimated_energy = estimated_phase * scale - shift
+
+    return counts, estimated_phase, estimated_energy, scale
+
+
+def plot_counts(counts: dict[str, int], output_path: Path) -> None:
+    """Save the QPE measurement histogram."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    labels = sorted(counts, key=lambda value: int(value, 2))
+    values = [counts[label] for label in labels]
+
+    plt.figure(figsize=(9, 4))
+    plt.bar(labels, values)
+    plt.xlabel("Measured bitstring")
+    plt.ylabel("Counts")
+    plt.title("QPE measurement distribution")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
+def main() -> None:
+    hamiltonian = build_h2_hamiltonian()
+    exact_energy, ground_state = exact_ground_state(hamiltonian)
+
+    counts, phase, estimated_energy, scale = run_qpe(
+        hamiltonian=hamiltonian,
+        eigenstate=ground_state,
+        n_counting_qubits=5,
+        shots=4096,
+    )
+
+    plot_counts(counts, Path("plots/qpe_distribution.png"))
+
+    print("Exact ground-state energy:", round(exact_energy, 8))
+    print("Estimated phase:", round(phase, 8))
+    print("Energy scale:", round(scale, 8))
+    print("QPE energy estimate:", round(estimated_energy, 8))
+    print("Absolute error:", round(abs(estimated_energy - exact_energy), 8))
+    print("Histogram saved to plots/qpe_distribution.png")
+
+
+if __name__ == "__main__":
+    main()
